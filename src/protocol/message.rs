@@ -5,7 +5,10 @@ use std::{
     str,
 };
 
-use super::frame::{CloseFrame, Frame};
+use super::frame::{
+    coding::{Data as OpData, OpCode},
+    CloseFrame, Frame, PreparedFrame,
+};
 use crate::error::{CapacityError, Error, Result};
 
 mod string_collect {
@@ -174,6 +177,8 @@ pub enum Message {
     Close(Option<CloseFrame<'static>>),
     /// Raw frame. Note, that you're not going to get this value while reading the message.
     Frame(Frame),
+    /// Raw prepared frame. Note, that you're not going to get this value while reading the message.
+    PreparedFrame(PreparedFrame),
 }
 
 impl Message {
@@ -227,6 +232,7 @@ impl Message {
             }
             Message::Close(ref data) => data.as_ref().map(|d| d.reason.len()).unwrap_or(0),
             Message::Frame(ref frame) => frame.len(),
+            Message::PreparedFrame(ref frame) => frame.len(),
         }
     }
 
@@ -244,6 +250,7 @@ impl Message {
             Message::Close(None) => Vec::new(),
             Message::Close(Some(frame)) => frame.reason.into_owned().into_bytes(),
             Message::Frame(frame) => frame.into_data(),
+            Message::PreparedFrame(frame) => frame.payload().to_vec(),
         }
     }
 
@@ -257,6 +264,7 @@ impl Message {
             Message::Close(None) => Ok(String::new()),
             Message::Close(Some(frame)) => Ok(frame.reason.into_owned()),
             Message::Frame(frame) => Ok(frame.into_string()?),
+            Message::PreparedFrame(frame) => Ok(frame.into_string()?),
         }
     }
 
@@ -271,6 +279,36 @@ impl Message {
             Message::Close(None) => Ok(""),
             Message::Close(Some(ref frame)) => Ok(&frame.reason),
             Message::Frame(ref frame) => Ok(frame.to_text()?),
+            Message::PreparedFrame(ref frame) => Ok(frame.to_text()?),
+        }
+    }
+
+    /// Convert this Message to a raw Frame.
+    ///
+    /// This method will panic if this Message contains a PreparedFrame.
+    pub fn into_frame(self) -> Frame {
+        match self {
+            Message::Text(data) => Frame::message(data.into(), OpCode::Data(OpData::Text), true),
+            Message::Binary(data) => Frame::message(data, OpCode::Data(OpData::Binary), true),
+            Message::Ping(data) => Frame::ping(data),
+            Message::Pong(data) => Frame::pong(data),
+            Message::Close(code) => Frame::close(code),
+            Message::Frame(f) => f,
+            Message::PreparedFrame(_) => panic!("Cannot recover Frame from a PreparedFrame"),
+        }
+    }
+
+    /// Convert this message into a new message containing a PreparedFrame.
+    ///
+    /// This allows cheaper cloning of the message by sharing buffers, which can be useful when
+    /// sending to multiple clients.
+    ///
+    /// Only servers can send prepared frames, because clients must apply a unique mask to each
+    /// frame they send, so each frame is different on the wire.
+    pub fn into_prepared(self) -> Message {
+        match self {
+            msg @ Message::PreparedFrame(_) => msg,
+            msg => Message::PreparedFrame(msg.into_frame().into_prepared()),
         }
     }
 }

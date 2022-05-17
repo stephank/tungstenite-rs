@@ -4,9 +4,9 @@
 //! It is filled by reading from a stream supporting `Read` and is then
 //! accessible as a cursor for reading bytes.
 
-use std::io::{Cursor, Read, Result as IoResult};
+use std::io::{Cursor, IoSlice, Read, Result as IoResult};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 /// A FIFO buffer for reading packets from the network.
 #[derive(Debug)]
@@ -84,6 +84,64 @@ impl<const CHUNK_SIZE: usize> Buf for ReadBuffer<CHUNK_SIZE> {
 impl<const CHUNK_SIZE: usize> Default for ReadBuffer<CHUNK_SIZE> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Represents a list of chained `Bytes`, and implements `Buf` over the entire sequence.
+#[derive(Default, Debug)]
+pub struct BytesList {
+    list: Vec<Bytes>,
+    len: usize,
+}
+
+impl BytesList {
+    /// Pushes a chunk to the end of the list.
+    pub fn push(&mut self, bytes: Bytes) {
+        self.len += bytes.len();
+        self.list.push(bytes);
+    }
+}
+
+impl Buf for BytesList {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        match self.list.get(0) {
+            Some(bytes) => bytes,
+            None => &[],
+        }
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut len = 0;
+        for (bytes, ioslice) in std::iter::zip(&self.list, dst) {
+            *ioslice = IoSlice::new(bytes);
+            len += 1;
+        }
+        len
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        let mut idx = 0;
+        while cnt > 0 {
+            let bytes = self.list.get_mut(idx).expect("Tried to advance beyond end of BytesList");
+            if cnt < bytes.len() {
+                bytes.advance(cnt);
+                self.len -= cnt;
+                break;
+            } else {
+                idx += 1;
+                self.len -= bytes.len();
+                cnt -= bytes.len();
+            }
+        }
+        if idx > 0 {
+            self.list.drain(..idx);
+        }
     }
 }
 

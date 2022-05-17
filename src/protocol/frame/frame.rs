@@ -1,4 +1,5 @@
 use byteorder::{ByteOrder, NetworkEndian, ReadBytesExt, WriteBytesExt};
+use bytes::Bytes;
 use log::*;
 use std::{
     borrow::Cow,
@@ -117,6 +118,13 @@ impl FrameHeader {
         }
 
         Ok(())
+    }
+
+    /// Format a header for the given payload size and return a buffer.
+    pub fn to_bytes(&self, length: u64) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.len(length));
+        self.format(length, &mut output).expect("Bug: can't write to vector");
+        output
     }
 
     /// Generate a random frame mask and store this in the header.
@@ -362,6 +370,18 @@ impl Frame {
         output.write_all(self.payload())?;
         Ok(())
     }
+
+    /// Returns a preformatted frame that can be sent multiple times.
+    ///
+    /// This function panics if a mask is set. Clients must mask each frame they send, so this only
+    /// works for frames sent by a server.
+    pub fn into_prepared(self) -> PreparedFrame {
+        assert!(self.header.mask.is_none(), "PreparedFrame cannot be used with masking");
+        PreparedFrame {
+            header: self.header.to_bytes(self.payload.len() as u64).into(),
+            payload: self.payload.into(),
+        }
+    }
 }
 
 impl fmt::Display for Frame {
@@ -384,6 +404,72 @@ payload: 0x{}
             self.header.opcode,
             // self.mask.map(|mask| format!("{:?}", mask)).unwrap_or("NONE".into()),
             self.len(),
+            self.payload.len(),
+            self.payload.iter().map(|byte| format!("{:x}", byte)).collect::<String>()
+        )
+    }
+}
+
+/// A frame that has been preformatted.
+///
+/// This type can be cheaply cloned, and can be wrapped inside a `Message` or used with
+/// `FrameSocket::write_prepared_frame`.
+///
+/// Only servers can send prepared frames, because clients must apply a unique mask to each frame
+/// they send, so each frame is different on the wire.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedFrame {
+    header: Bytes,
+    payload: Bytes,
+}
+
+impl PreparedFrame {
+    /// Returns the preformatted header.
+    #[inline]
+    pub fn header(&self) -> &Bytes {
+        &self.header
+    }
+
+    /// Returns the payload.
+    #[inline]
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    /// Returns the payload length.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Check if the frame is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get frame payload as `&str`.
+    #[inline]
+    pub fn to_text(&self) -> Result<&str, Utf8Error> {
+        std::str::from_utf8(&self.payload)
+    }
+
+    /// Returns a copy of the payload as a string.
+    #[inline]
+    pub fn into_string(self) -> Result<String, Utf8Error> {
+        Ok(self.to_text()?.to_string())
+    }
+}
+
+impl fmt::Display for PreparedFrame {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "
+<PREPARED FRAME>
+payload length: {}
+payload: 0x{}
+            ",
             self.payload.len(),
             self.payload.iter().map(|byte| format!("{:x}", byte)).collect::<String>()
         )

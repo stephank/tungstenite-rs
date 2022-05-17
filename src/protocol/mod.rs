@@ -16,7 +16,7 @@ use std::{
 use self::{
     frame::{
         coding::{CloseCode, Control as OpCtl, Data as OpData, OpCode},
-        Frame, FrameCodec,
+        Frame, FrameCodec, PreparedFrame,
     },
     message::{IncompleteMessage, IncompleteMessageType},
 };
@@ -236,11 +236,17 @@ pub struct WebSocketContext {
     /// Receive: an incomplete message being processed.
     incomplete: Option<IncompleteMessage>,
     /// Send: a data send queue.
-    send_queue: VecDeque<Frame>,
+    send_queue: VecDeque<QueueEntry>,
     /// Send: an OOB pong message.
     pong: Option<Frame>,
     /// The configuration for the websocket session.
     config: WebSocketConfig,
+}
+
+#[derive(Debug)]
+enum QueueEntry {
+    Frame(Frame),
+    PreparedFrame(PreparedFrame),
 }
 
 impl WebSocketContext {
@@ -347,19 +353,26 @@ impl WebSocketContext {
             }
         }
 
-        let frame = match message {
-            Message::Text(data) => Frame::message(data.into(), OpCode::Data(OpData::Text), true),
-            Message::Binary(data) => Frame::message(data, OpCode::Data(OpData::Binary), true),
-            Message::Ping(data) => Frame::ping(data),
+        match message {
             Message::Pong(data) => {
                 self.pong = Some(Frame::pong(data));
                 return self.write_pending(stream);
             }
-            Message::Close(code) => return self.close(stream, code),
-            Message::Frame(f) => f,
+            Message::Close(code) => {
+                return self.close(stream, code);
+            }
+            Message::PreparedFrame(frame) => {
+                assert_eq!(
+                    self.role,
+                    Role::Server,
+                    "PreparedFrame is not available for client sockets"
+                );
+                self.send_queue.push_back(QueueEntry::PreparedFrame(frame));
+            }
+            _ => {
+                self.send_queue.push_back(QueueEntry::Frame(message.into_frame()));
+            }
         };
-
-        self.send_queue.push_back(frame);
         self.write_pending(stream)
     }
 
@@ -376,12 +389,12 @@ impl WebSocketContext {
         // respond with Pong frame as soon as is practical. (RFC 6455)
         if let Some(pong) = self.pong.take() {
             trace!("Sending pong reply");
-            self.send_one_frame(stream, pong)?;
+            self.send_one_frame(stream, QueueEntry::Frame(pong))?;
         }
         // If we have any unsent frames, send them.
         trace!("Frames still in queue: {}", self.send_queue.len());
-        while let Some(data) = self.send_queue.pop_front() {
-            self.send_one_frame(stream, data)?;
+        while let Some(entry) = self.send_queue.pop_front() {
+            self.send_one_frame(stream, entry)?;
         }
 
         // If we get to this point, the send queue is empty and the underlying socket is still
@@ -414,7 +427,7 @@ impl WebSocketContext {
         if let WebSocketState::Active = self.state {
             self.state = WebSocketState::ClosedByUs;
             let frame = Frame::close(code);
-            self.send_queue.push_back(frame);
+            self.send_queue.push_back(QueueEntry::Frame(frame));
         } else {
             // Already closed, nothing to do.
         }
@@ -571,7 +584,7 @@ impl WebSocketContext {
 
                 let reply = Frame::close(close.clone());
                 debug!("Replying to close with {:?}", reply);
-                self.send_queue.push_back(reply);
+                self.send_queue.push_back(QueueEntry::Frame(reply));
 
                 Some(close)
             }
@@ -589,21 +602,31 @@ impl WebSocketContext {
     }
 
     /// Send a single pending frame.
-    fn send_one_frame<Stream>(&mut self, stream: &mut Stream, mut frame: Frame) -> Result<()>
+    fn send_one_frame<Stream>(&mut self, stream: &mut Stream, entry: QueueEntry) -> Result<()>
     where
         Stream: Read + Write,
     {
-        match self.role {
-            Role::Server => {}
-            Role::Client => {
-                // 5.  If the data is being sent by the client, the frame(s) MUST be
-                // masked as defined in Section 5.3. (RFC 6455)
-                frame.set_random_mask();
+        match entry {
+            QueueEntry::Frame(mut frame) => {
+                match self.role {
+                    Role::Server => {}
+                    Role::Client => {
+                        // 5.  If the data is being sent by the client, the frame(s) MUST be
+                        // masked as defined in Section 5.3. (RFC 6455)
+                        frame.set_random_mask();
+                    }
+                }
+
+                trace!("Sending frame: {:?}", frame);
+                self.frame.write_frame(stream, frame).check_connection_reset(self.state)
+            }
+            QueueEntry::PreparedFrame(frame) => {
+                debug_assert_eq!(self.role, Role::Server);
+
+                trace!("Sending frame: {:?}", frame);
+                self.frame.write_prepared_frame(stream, &frame).check_connection_reset(self.state)
             }
         }
-
-        trace!("Sending frame: {:?}", frame);
-        self.frame.write_frame(stream, frame).check_connection_reset(self.state)
     }
 }
 

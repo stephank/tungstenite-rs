@@ -6,12 +6,14 @@ pub mod coding;
 mod frame;
 mod mask;
 
-use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write};
+use std::io::{Error as IoError, ErrorKind as IoErrorKind, IoSlice, Read, Write};
 
+use bytes::{Buf, BufMut, BytesMut};
 use log::*;
 
-pub use self::frame::{CloseFrame, Frame, FrameHeader};
+pub use self::frame::{CloseFrame, Frame, FrameHeader, PreparedFrame};
 use crate::{
+    buffer::BytesList,
     error::{CapacityError, Error, Result},
     ReadBuffer,
 };
@@ -66,13 +68,25 @@ impl<Stream> FrameSocket<Stream>
 where
     Stream: Write,
 {
-    /// Write a frame to stream.
+    /// Write a frame to the stream.
     ///
     /// This function guarantees that the frame is queued regardless of any errors.
     /// There is no need to resend the frame. In order to handle WouldBlock or Incomplete,
     /// call write_pending() afterwards.
     pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
         self.codec.write_frame(&mut self.stream, frame)
+    }
+
+    /// Write a prepared frame to the stream.
+    ///
+    /// Only servers can send prepared frames, because clients must apply a unique mask to each
+    /// frame they send, so each frame is different on the wire.
+    ///
+    /// This function guarantees that the frame is queued regardless of any errors.
+    /// There is no need to resend the frame. In order to handle WouldBlock or Incomplete,
+    /// call write_pending() afterwards.
+    pub fn write_prepared_frame(&mut self, frame: &PreparedFrame) -> Result<()> {
+        self.codec.write_prepared_frame(&mut self.stream, frame)
     }
 
     /// Complete pending write, if any.
@@ -86,8 +100,12 @@ where
 pub(super) struct FrameCodec {
     /// Buffer to read data from the stream.
     in_buffer: ReadBuffer,
-    /// Buffer to send packets to the network.
-    out_buffer: Vec<u8>,
+    /// Queue of buffers to write to the stream.
+    /// Can contain a mix of slices from scratch_buffer and PreparedFrames.
+    out_buffer: BytesList,
+    /// Buffer used to prepare frames to write to the stream.
+    /// As slices are released from out_buffer, BytesMut should be able to reuse allocations.
+    scratch_buffer: BytesMut,
     /// Header and remaining size of the incoming packet being processed.
     header: Option<(FrameHeader, u64)>,
 }
@@ -95,14 +113,20 @@ pub(super) struct FrameCodec {
 impl FrameCodec {
     /// Create a new frame codec.
     pub(super) fn new() -> Self {
-        Self { in_buffer: ReadBuffer::new(), out_buffer: Vec::new(), header: None }
+        Self {
+            in_buffer: ReadBuffer::new(),
+            out_buffer: BytesList::default(),
+            scratch_buffer: BytesMut::new(),
+            header: None,
+        }
     }
 
     /// Create a new frame codec from partially read data.
     pub(super) fn from_partially_read(part: Vec<u8>) -> Self {
         Self {
             in_buffer: ReadBuffer::from_partially_read(part),
-            out_buffer: Vec::new(),
+            out_buffer: BytesList::default(),
+            scratch_buffer: BytesMut::new(),
             header: None,
         }
     }
@@ -143,7 +167,7 @@ impl FrameCodec {
                         // No truncation here since `length` is checked above
                         let mut payload = Vec::with_capacity(length as usize);
                         if length > 0 {
-                            cursor.take(length).read_to_end(&mut payload)?;
+                            Read::take(cursor, length).read_to_end(&mut payload)?;
                         }
                         break payload;
                     }
@@ -171,8 +195,25 @@ impl FrameCodec {
         Stream: Write,
     {
         trace!("writing frame {}", frame);
-        self.out_buffer.reserve(frame.len());
-        frame.format(&mut self.out_buffer).expect("Bug: can't write to vector");
+        self.scratch_buffer.reserve(frame.len());
+        let mut writer = (&mut self.scratch_buffer).writer();
+        frame.format(&mut writer).expect("Bug: can't write to buffer");
+        self.out_buffer.push(self.scratch_buffer.split().freeze());
+        self.write_pending(stream)
+    }
+
+    /// Write a prepared frame to the provided stream.
+    pub(super) fn write_prepared_frame<Stream>(
+        &mut self,
+        stream: &mut Stream,
+        frame: &PreparedFrame,
+    ) -> Result<()>
+    where
+        Stream: Write,
+    {
+        trace!("writing prepared frame {}", frame);
+        self.out_buffer.push(frame.header().clone());
+        self.out_buffer.push(frame.payload().clone());
         self.write_pending(stream)
     }
 
@@ -181,8 +222,14 @@ impl FrameCodec {
     where
         Stream: Write,
     {
-        while !self.out_buffer.is_empty() {
-            let len = stream.write(&self.out_buffer)?;
+        loop {
+            let mut ioslices = [IoSlice::new(&[]); 32];
+            let num_ioslices = self.out_buffer.chunks_vectored(&mut ioslices);
+            if num_ioslices == 0 {
+                break;
+            }
+
+            let len = stream.write_vectored(&ioslices[..num_ioslices])?;
             if len == 0 {
                 // This is the same as "Connection reset by peer"
                 return Err(IoError::new(
@@ -191,7 +238,7 @@ impl FrameCodec {
                 )
                 .into());
             }
-            self.out_buffer.drain(0..len);
+            self.out_buffer.advance(len);
         }
         stream.flush()?;
         Ok(())
